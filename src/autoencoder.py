@@ -32,7 +32,6 @@ class TextAutoencoder(object):
         self.go = go
         self.eos = go
 
-        self.bidirectional = bidirectional
         self.vocab_size = embeddings.shape[0]
         self.embedding_size = embeddings.shape[1]
         self.global_step = tf.Variable(0, name='global_step', trainable=False)
@@ -56,49 +55,26 @@ class TextAutoencoder(object):
         name = 'decoder_fw_step_state_h'
         self.decoder_fw_step_h = tf.placeholder(tf.float32,
                                                 [None, lstm_units], name)
-        self.decoder_bw_step_c = tf.placeholder(tf.float32,
-                                                [None, lstm_units],
-                                                'decoder_bw_step_state_c')
-        self.decoder_bw_step_h = tf.placeholder(tf.float32,
-                                                [None, lstm_units],
-                                                'decoder_bw_step_state_h')
 
         with tf.variable_scope('autoencoder') as self.scope:
             self.embeddings = tf.Variable(embeddings, name='embeddings',
                                           trainable=train_embeddings)
 
             initializer = tf.glorot_normal_initializer()
-            self.lstm_fw = tf.nn.rnn_cell.LSTMCell(lstm_units,
-                                                   initializer=initializer)
-            self.lstm_bw = tf.nn.rnn_cell.LSTMCell(lstm_units,
-                                                   initializer=initializer)
 
             embedded = tf.nn.embedding_lookup(self.embeddings, self.sentence)
             embedded = tf.nn.dropout(embedded, self.dropout_keep)
 
             # encoding step
-            if bidirectional:
-                bdr = tf.nn.bidirectional_dynamic_rnn
-                ret = bdr(self.lstm_fw, self.lstm_bw,
-                          embedded, dtype=tf.float32,
-                          sequence_length=self.sentence_size,
-                          scope=self.scope)
-            else:
-                ret = tf.nn.dynamic_rnn(self.lstm_fw, embedded,
+            self.lstm_fw = tf.nn.rnn_cell.LSTMCell(lstm_units,
+                                                   initializer=initializer)
+            ret = tf.nn.dynamic_rnn(self.lstm_fw, embedded,
                                         dtype=tf.float32,
                                         sequence_length=self.sentence_size,
                                         scope=self.scope)
             _, self.encoded_state = ret
-            if bidirectional:
-                encoded_state_fw, encoded_state_bw = self.encoded_state
-
-                # set the scope name used inside the decoder.
-                # maybe there's a more elegant way to do it?
-                fw_scope_name = self.scope.name + '/fw'
-                bw_scope_name = self.scope.name + '/bw'
-            else:
-                encoded_state_fw = self.encoded_state
-                fw_scope_name = self.scope
+            encoded_state_fw = self.encoded_state
+            fw_scope_name = self.scope
 
             self.scope.reuse_variables()
 
@@ -113,20 +89,22 @@ class TextAutoencoder(object):
 
             # decoding step
 
+            # NOTE: DECODER'S INPUT:
+            # training: input is the target sequence embedded with start and end tags.
+            # Model is predicting the next element of the target sequence given the current element
+
+            # inference: output of each time step is input to the next. First input
+            # item is encoder's output. See diagram for example here
+            # https://medium.com/@Aj.Cheng/seq2seq-18a0730d1d77
+
             # We give the same inputs to the forward and backward LSTMs,
             # but each one has its own hidden state
             # their outputs are concatenated and fed to the softmax layer
-            if bidirectional:
-                outputs, _ = tf.nn.bidirectional_dynamic_rnn(
-                    self.lstm_fw, self.lstm_bw, decoder_input,
-                    self.sentence_size, encoded_state_fw, encoded_state_bw)
 
-                # concat fw and bw outputs
-                outputs = tf.concat(outputs, -1)
-            else:
-                outputs, _ = tf.nn.dynamic_rnn(
-                    self.lstm_fw, decoder_input, self.sentence_size,
-                    encoded_state_fw)
+            # Initial state for decoder is the last hidden state of encoder
+            outputs, _ = tf.nn.dynamic_rnn(
+                cell=self.lstm_fw, inputs=decoder_input, sequence_length=self.sentence_size,
+                initial_state=encoded_state_fw)
 
             self.decoder_outputs = outputs
 
@@ -140,20 +118,12 @@ class TextAutoencoder(object):
                                                self.decoder_step_input)
         state_fw = tf.nn.rnn_cell.LSTMStateTuple(self.decoder_fw_step_c,
                                                  self.decoder_fw_step_h)
-        state_bw = tf.nn.rnn_cell.LSTMStateTuple(self.decoder_bw_step_c,
-                                                 self.decoder_bw_step_h)
+
         with tf.variable_scope(fw_scope_name, reuse=True):
             ret_fw = self.lstm_fw(embedded_step, state_fw)
         step_output_fw, self.decoder_fw_step_state = ret_fw
 
-        if bidirectional:
-            with tf.variable_scope(bw_scope_name, reuse=True):
-                ret_bw = self.lstm_bw(embedded_step, state_bw)
-                step_output_bw, self.decoder_bw_step_state = ret_bw
-                step_output = tf.concat(axis=1, values=[step_output_fw,
-                                                        step_output_bw])
-        else:
-            step_output = step_output_fw
+        step_output = step_output_fw
 
         with tf.variable_scope(self.projection_scope, reuse=True):
             self.projected_step_output = tf.layers.dense(step_output,
@@ -298,8 +268,7 @@ class TextAutoencoder(object):
         metadata = {'vocab_size': self.vocab_size,
                     'embedding_size': self.embedding_size,
                     'num_units': self.lstm_fw.output_size,
-                    'go': self.go,
-                    'bidirectional': self.bidirectional
+                    'go': self.go
                     }
         metadata_path = os.path.join(directory, 'metadata.json')
         with open(metadata_path, 'w') as f:
@@ -348,9 +317,6 @@ class TextAutoencoder(object):
                  self.sentence_size: sizes,
                  self.dropout_keep: 1}
         state = session.run(self.encoded_state, feeds)
-        if self.bidirectional:
-            state_fw, state_bw = state
-            return np.hstack((state_fw.c, state_bw.c))
         return state.c
 
     def run(self, session, inputs, sizes):
@@ -370,10 +336,7 @@ class TextAutoencoder(object):
                  self.sentence_size: sizes,
                  self.dropout_keep: 1}
         state = session.run(self.encoded_state, feeds)
-        if self.bidirectional:
-            state_fw, state_bw = state
-        else:
-            state_fw = state
+        state_fw = state
 
         time_steps = 0
         max_time_steps = 2 * len(inputs[0])
@@ -392,18 +355,9 @@ class TextAutoencoder(object):
                      self.decoder_fw_step_h: state_fw.h,
                      self.decoder_step_input: input_symbol,
                      self.dropout_keep: 1}
-            if self.bidirectional:
-                feeds[self.decoder_bw_step_c] = state_bw.c
-                feeds[self.decoder_bw_step_h] = state_bw.h
-
-                ops = [self.projected_step_output,
-                       self.decoder_fw_step_state,
-                       self.decoder_bw_step_state]
-                outputs, state_fw, state_bw = session.run(ops, feeds)
-            else:
-                ops = [self.projected_step_output,
+            ops = [self.projected_step_output,
                        self.decoder_fw_step_state]
-                outputs, state_fw = session.run(ops, feeds)
+            outputs, state_fw = session.run(ops, feeds)
 
             input_symbol = outputs.argmax(1)
             answer.append(input_symbol)
